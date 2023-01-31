@@ -1,0 +1,127 @@
+pipeline {
+  environment{
+    USER_CREDENTIAL = credentials('devops')
+    DOCKER_REPOSITORY = 'URL DOCKER REPOSITORY'
+    HELM_REPOSITORY = 'HEL URL'
+    PROJECT_NAME = 'PROJECT NAME'
+    DEPLOY_CONTEXT = '/'
+    PROJECT_VERSION = 'VERSION'
+  }
+
+  parameters{
+    string name: 'DEPLOY_NAMESPACE', defaultValue:'NAME SPACE IN THE CLUSTER' 
+    string name: 'DEPLOY_DOMAIN', defaultValue:'DOMAIN'
+  }
+
+  agent {
+    kubernetes {
+      yaml '''
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          labels:
+            app: test
+        spec:
+          hostAliases:
+          - ip: "Server IP"
+            hostnames:
+              - "Reposutori domain"
+          - ip: "Server IP"
+            hostnames:
+              - "Docker domain"
+          containers:
+          - name: node
+            image: node:16.17.0-alpine3.16
+            command:
+            - cat
+            tty: true
+          - name: docker
+            image: docker:20.10.18-cli-alpine3.16
+            command:
+            - cat
+            tty: true
+            volumeMounts:
+            - mountPath: /var/run/docker.sock
+              name: docker-sock
+          - name: helm
+            image: alpine/helm:3.10.0
+            command:
+            - cat
+            tty: true
+          volumes:
+          - name: docker-sock
+            hostPath:
+              path: /var/run/docker.sock
+      '''
+    }
+  }
+  stages {
+    stage('Install dependencies') {
+      when { expression { true } }
+      steps {
+        container('node') {
+          sh 'npm i -f'
+        }
+      }
+    }
+    stage('Build project') {
+      when { expression { true } }
+      steps {
+        container('node') {
+          sh 'npm run build:ci'
+        }
+      }
+    }
+    stage('Build and publish docker image') {
+      when { expression { true } }
+      steps {
+        container('docker') {
+          sh 'docker build -t $DOCKER_REPOSITORY/kerp/$PROJECT_NAME:$PROJECT_VERSION -f deploy/docker/Dockerfile .'
+          sh 'docker login $DOCKER_REPOSITORY -u $USER_CREDENTIAL_USR -p $USER_CREDENTIAL_PSW'
+          sh 'docker push $DOCKER_REPOSITORY/kerp/$PROJECT_NAME:$PROJECT_VERSION'
+          sh 'docker rmi $DOCKER_REPOSITORY/kerp/$PROJECT_NAME:$PROJECT_VERSION'
+        }
+      }
+    }
+    stage('Build and publish chart') {
+      when { expression { true } }
+      steps {
+        container('helm') {
+          sh 'helm repo add RepositoryURL-seed/ --username $USER_CREDENTIAL_USR --password $USER_CREDENTIAL_PSW'
+          sh 'helm repo add $HELM_REPOSITORY RepositoryURL-seed/repository/$HELM_REPOSITORY/ --username $USER_CREDENTIAL_USR --password $USER_CREDENTIAL_PSW'
+          sh 'helm repo update'
+          sh 'helm dependency update deploy/helm'
+          sh 'helm package ./deploy/helm'
+          sh 'helm plugin install --version master https://github.com/sonatype-nexus-community/helm-nexus-push.git'
+          sh 'apk update'
+          sh 'apk upgrade'
+          sh 'apk add bash'
+          sh 'helm nexus-push $HELM_REPOSITORY $PROJECT_NAME-$PROJECT_VERSION.tgz -u $USER_CREDENTIAL_USR -p $USER_CREDENTIAL_PSW'
+        }
+      }
+    }
+    stage('Deploy') {
+      when { expression { true } }
+      steps {
+        container('helm') {
+          sh 'curl -LO https://dl.k8s.io/release/v1.25.1/bin/linux/amd64/kubectl \
+                && mv kubectl /bin/kubectl \
+                && chmod a+x /bin/kubectl'
+          withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'k8s', namespace: '', serverUrl: '') {
+            script {
+              try {
+                sh 'helm uninstall $PROJECT_NAME -n $DEPLOY_NAMESPACE'
+              } catch (Exception e) {
+                echo 'Exception to uninstall: ' +  e.toString()
+              }
+            }
+            sh 'helm install $PROJECT_NAME ./deploy/helm \
+                --set "ingress.hosts[0].host=$DEPLOY_DOMAIN,ingress.hosts[0].paths[0].path=$DEPLOY_CONTEXT" \
+                --set "ingress.tls[0].hosts[0]=$DEPLOY_DOMAIN,ingress.tls[0].secretName=kc-tls-sct" \
+                -n $DEPLOY_NAMESPACE'
+          }
+        }
+      }
+    }
+  }
+}
